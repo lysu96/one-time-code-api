@@ -1,91 +1,84 @@
 require("dotenv").config();
 const express = require("express");
-const mysql = require("mysql2/promise");
+const { Pool } = require("pg");
 
 const app = express();
+const port = process.env.PORT || 3000;
+
 app.use(express.json());
 
-// Kết nối MySQL dùng biến môi trường
-const db = mysql.createPool({
+const pool = new Pool({
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT,
+  ssl: {
+    rejectUnauthorized: false,
+  },
 });
 
-// Hàm tạo mã ngẫu nhiên
-function generateRandomCode(length = 10) {
-  return Math.random().toString(36).substr(2, length).toUpperCase();
+// Tự tạo bảng nếu chưa có
+async function createTableIfNotExists() {
+  const query = `
+    CREATE TABLE IF NOT EXISTS one_time_codes (
+      id SERIAL PRIMARY KEY,
+      code VARCHAR(255) UNIQUE NOT NULL,
+      used BOOLEAN DEFAULT false,
+      expires_at TIMESTAMP NOT NULL
+    );
+  `;
+  await pool.query(query);
 }
 
-// Tạo mã dùng một lần (hết hạn sau 10 phút)
+// Sinh mã ngẫu nhiên
+function generateRandomCode(length = 8) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  return Array.from({ length }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+}
+
 app.post("/generate", async (req, res) => {
   const code = generateRandomCode();
-  const expiresAt = new Date(Date.now() + 10 * 60000); // 10 phút
+  const expires_at = new Date(Date.now() + 10 * 60 * 1000); // 10 phút
 
   try {
-    await db.query(
-      "INSERT INTO one_time_codes (code, expires_at) VALUES (?, ?)",
-      [code, expiresAt]
+    await pool.query(
+      "INSERT INTO one_time_codes (code, expires_at) VALUES ($1, $2)",
+      [code, expires_at]
     );
-    res.json({ success: true, code, expires_at: expiresAt });
+    res.json({ success: true, code, expires_at });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Lỗi tạo mã" });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Sử dụng mã một lần
 app.post("/use-code", async (req, res) => {
   const { code } = req.body;
-  if (!code) return res.status(400).json({ error: "Thiếu mã" });
 
-  const conn = await db.getConnection();
   try {
-    await conn.beginTransaction();
-
-    const [rows] = await conn.query(
-      "SELECT * FROM one_time_codes WHERE code = ? AND used_at IS NULL AND expires_at > NOW()",
+    const result = await pool.query(
+      "SELECT * FROM one_time_codes WHERE code = $1 AND used = false AND expires_at > NOW()",
       [code]
     );
 
-    if (rows.length === 0) {
-      await conn.rollback();
-      return res.status(404).json({ error: "Mã không hợp lệ, đã dùng hoặc hết hạn" });
+    if (result.rowCount === 0) {
+      return res.status(400).json({ success: false, message: "Invalid or expired code" });
     }
 
-    const usedAt = new Date();
-    await conn.query(
-      "UPDATE one_time_codes SET used_at = ? WHERE code = ?",
-      [usedAt, code]
+    await pool.query(
+      "UPDATE one_time_codes SET used = true WHERE code = $1",
+      [code]
     );
 
-    await conn.commit();
-    res.json({ success: true, message: "Mã hợp lệ và đã được sử dụng", used_at: usedAt });
+    res.json({ success: true, message: "Code used successfully" });
   } catch (err) {
-    await conn.rollback();
-    console.error(err);
-    res.status(500).json({ error: "Lỗi hệ thống" });
-  } finally {
-    conn.release();
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Dọn dẹp mã đã dùng hoặc hết hạn
-app.delete("/cleanup", async (req, res) => {
-  try {
-    const [result] = await db.query(
-      "DELETE FROM one_time_codes WHERE used_at IS NOT NULL OR expires_at <= NOW()"
-    );
-    res.json({ success: true, deleted: result.affectedRows });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Lỗi dọn dẹp mã" });
-  }
-});
-
-// Khởi chạy server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server chạy tại http://localhost:${PORT}`);
+// Tự tạo bảng trước khi server chạy
+createTableIfNotExists().then(() => {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
 });
